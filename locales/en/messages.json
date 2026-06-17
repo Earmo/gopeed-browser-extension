@@ -42,7 +42,7 @@
     "message": "Set domains that do not need to be captured"
   },
   "domain_filter_placeholder": {
-    "message": "Enter one domain per line, e.g.: example.com"
+    "message": "Enter one domain per line. Supports exact match (example.com), subdomain match (*.example.com), all match (*example.com), and contains match (*example.com*)"
   },
   "file_type_filter": {
     "message": "File Type Filter"
@@ -193,5 +193,11 @@
   },
   "notification_no_handler": {
     "message": "Unable to create download task"
+  },
+  "add_server": {
+    "message": "Add Server"
+  },
+  "edit_server": {
+    "message": "Edit Server"
   }
 }

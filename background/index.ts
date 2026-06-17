@@ -71,10 +71,7 @@ function initContextMenus() {
     const downloadInfo: DownloadInfo = {
       url: url,
       filename: filename,
-      filesize: 0, // Unknown file size for context menu downloads
-      ua: navigator.userAgent,
-      referrer: tab?.url || url,
-      cookieStoreId: (tab as any)?.cookieStoreId
+      filesize: 0 // Unknown file size for context menu downloads
     }
 
     // Get download handler and execute
@@ -169,18 +166,60 @@ chrome.runtime.onStartup &&
   }, 3000)
   await refreshSettings()
   await refreshIsRunning()
-  
+
   // Initialize context menus
   initContextMenus()
+
+  // Cleanup old entries from downloadEventSkipMap every 30 seconds
+  // to prevent memory leaks in case onCreated never fires
+  setInterval(() => {
+    // Note: Since we're using URL as key and deleting immediately after use,
+    // this is just a safety net. In practice, entries should be deleted quickly.
+    if (downloadEventSkipMap.size > 100) {
+      // If map grows too large, clear it entirely as a safety measure
+      downloadEventSkipMap.clear()
+    }
+    if (requestHeaderMap.size > 100) {
+      requestHeaderMap.clear()
+    }
+  }, 30000)
 })()
 
 interface DownloadInfo {
   url: string
   filename: string
   filesize: number
-  ua?: string
-  referrer?: string
-  cookieStoreId?: string
+  tabId?: number
+}
+
+const requestHeaderMap = new Map<string, Record<string, string>>()
+
+function storeRequestHeaders(details: chrome.webRequest.WebRequestHeadersDetails) {
+  if (!details.requestHeaders || details.requestHeaders.length === 0) {
+    return
+  }
+
+  const requestHeaders = details.requestHeaders.reduce<Record<string, string>>(
+    (acc, header) => {
+      if (header.name && header.value) {
+        acc[header.name] = header.value
+      }
+      return acc
+    },
+    {}
+  )
+
+  if (Object.keys(requestHeaders).length > 0) {
+    requestHeaderMap.set(details.url, requestHeaders)
+  }
+}
+
+function consumeRequestHeaders(url: string): Record<string, string> {
+  const headers = requestHeaderMap.get(url) || {}
+  if (requestHeaderMap.has(url)) {
+    requestHeaderMap.delete(url)
+  }
+  return headers
 }
 
 function downloadFilter(info: DownloadInfo, settings: Settings): boolean {
@@ -196,9 +235,13 @@ function downloadFilter(info: DownloadInfo, settings: Settings): boolean {
   }
   if (settings.excludeDomains.enabled) {
     const excludes = settings.excludeDomains.list.split("\n")
+      .map(ex => ex.trim())
+      .filter(ex => ex.length > 0)
     const host = new URL(info.url).host
-    if (excludes.includes(host)) {
-      return false
+    for (const exclude of excludes) {
+      if (isDomainMatch(host, exclude)) {
+        return false
+      }
     }
   }
   if (settings.excludeFileTypes.enabled && info.filename) {
@@ -243,19 +286,24 @@ const downloadEvent =
   chrome.downloads.onDeterminingFilename || chrome.downloads.onCreated
 // In Firefox, the download interception logic will be triggered twice, the order is onHeadersReceived -> onCreated, so a variable is needed to skip the onCreated event to avoid duplicate processing of download tasks.
 // PS: Why not use the onCreated event uniformly? Because the onCreated event cannot get the size of the downloaded file in Firefox.
-let downloadEventSkip = false
+// Use a Map to track skip status per-download to avoid race conditions with multiple tabs
+const downloadEventSkipMap = new Map<string, boolean>()
+
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  storeRequestHeaders,
+  { urls: ["<all_urls>"], types: ["main_frame", "sub_frame"] },
+  isFirefox ? ["requestHeaders"] : ["requestHeaders", "extraHeaders"]
+)
 
 downloadEvent.addListener(async function (item) {
   const info: DownloadInfo = {
     url: item.finalUrl || item.url,
     filename: item.filename,
-    filesize: item.fileSize,
-    ua: navigator.userAgent,
-    referrer: item.referrer,
-    cookieStoreId: (item as any).cookieStoreId
+    filesize: item.fileSize
   }
-  if (isFirefox && downloadEventSkip) {
-    downloadEventSkip = false
+  const downloadUrl = item.finalUrl || item.url
+  if (isFirefox && downloadEventSkipMap.get(downloadUrl)) {
+    downloadEventSkipMap.delete(downloadUrl)
     return
   }
 
@@ -305,7 +353,7 @@ if (isFirefox) {
       }
 
       // Skip the onCreated event to avoid duplicate processing of download tasks.
-      downloadEventSkip = true
+      downloadEventSkipMap.set(res.url, true)
 
       let filename = ""
       // Parse filename from content-disposition
@@ -328,9 +376,7 @@ if (isFirefox) {
         url: res.url,
         filename,
         filesize,
-        ua: navigator.userAgent,
-        referrer: (res as any).originUrl,
-        cookieStoreId: (res as any).cookieStoreId
+        tabId: res.tabId
       }
       if (!downloadFilter(info, settingsCache)) {
         return
@@ -371,23 +417,26 @@ function handleRemoteDownload(
   // Multiple servers available and manual selection is enabled - show server selector
   return async () => {
     try {
-      // Show server selector overlay
-      const tabs = await chrome.tabs.query({
-        active: true,
-        currentWindow: true
-      })
-      if (tabs.length === 0) {
-        // Fallback to default server if no active tab
-        const defaultServer = settings.remote.servers.find(
-          (server) => getFullUrl(server) === settings.remote.selectedServer
-        )
-        if (defaultServer) {
-          await createDownloadTask(info, defaultServer, settings)()
+      // Use the tabId from the download info (for Firefox webRequest) or query for active tab
+      let tabId = info.tabId
+      if (tabId === undefined) {
+        const tabs = await chrome.tabs.query({
+          active: true,
+          currentWindow: true
+        })
+        if (tabs.length === 0) {
+          // Fallback to default server if no active tab
+          const defaultServer = settings.remote.servers.find(
+            (server) => getFullUrl(server) === settings.remote.selectedServer
+          )
+          if (defaultServer) {
+            await createDownloadTask(info, defaultServer, settings)()
+          }
+          return
         }
-        return
+        tabId = tabs[0].id!
       }
 
-      const tabId = tabs[0].id!
       const requestId = tabId.toString()
 
       // Send message to content script to show server selector
@@ -601,26 +650,54 @@ function handleNativeDownload(
   }
 }
 
-function getCookie(url: string, storeId?: string) {
-  return new Promise<string>((resolve) => {
-    chrome.cookies.getAll({ url, storeId }, (cookies) => {
-      resolve(
-        cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ")
-      )
-    })
-  })
-}
-
 async function toCreateRequest(info: DownloadInfo): Promise<Request> {
-  const cookie = await getCookie(info.url, (info as any).cookieStoreId)
+  const capturedHeaders = consumeRequestHeaders(info.url)
+  // Force an identity response body to avoid encoded payloads that break multi-part downloading.
   return {
     url: info.url,
     extra: {
       header: {
-        "User-Agent": navigator.userAgent,
-        Cookie: cookie ? cookie : undefined,
-        Referer: info.referrer ? info.referrer : undefined
+        ...capturedHeaders,
+        "Accept-Encoding": "identity"
       }
     }
   }
+}
+
+function isDomainMatch(host: string, pattern: string): boolean {
+  const patternLen = pattern.length;
+
+  // Handle different pattern types based on leading/trailing characters
+  if (patternLen > 2 && pattern[0] === '*' && pattern[patternLen - 1] === '*') {
+    // Contains match: *example.com* matches any domain containing example.com
+    const middlePattern = pattern.substring(1, patternLen - 1);
+    return host.includes(middlePattern);
+  }
+
+  if (patternLen > 1 && pattern[0] === '*') {
+    if (pattern[1] === '.') {
+      // Subdomain match: *.example.com matches subdomains but not the domain itself
+      const parentDomain = pattern.substring(2); // example.com
+      return host !== parentDomain && host.endsWith('.' + parentDomain);
+    } else {
+      // All match: *example.com matches domain and all subdomains
+      const parentDomain = pattern.substring(1); // example.com
+      return host === parentDomain || host.endsWith('.' + parentDomain);
+    }
+  }
+
+  if (patternLen > 1 && pattern[0] === '/' && pattern[patternLen - 1] === '/') {
+    // Regex match: /pattern/ matches using regular expression
+    try {
+      const regexPattern = pattern.substring(1, patternLen - 1);
+      const regex = new RegExp(regexPattern);
+      return regex.test(host);
+    } catch (e) {
+      console.warn(`Invalid regex pattern: ${pattern}`);
+      return false;
+    }
+  }
+
+  // Exact match: example.com only matches example.com
+  return pattern === host;
 }
